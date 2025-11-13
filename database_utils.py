@@ -1,133 +1,131 @@
-# =====================================================
-# ⚙️ DATABASE UTILITIES UNTUK GAME ELDRAHTHIA
-# =====================================================
-import aiosqlite
-import json
+"""Utility helpers that sit on top of :mod:`database`.
+
+The module previously mixed different storage approaches for area
+progress and duplicated imports.  The helpers below provide a consistent
+API that is reused by the bot handlers.
+"""
+
+from __future__ import annotations
+
 from functools import wraps
+from typing import Any, Awaitable, Callable, Dict
+
 import aiosqlite
 from telegram import Update
 
-# Struktur tabel area_progress (buat dulu lewat SQLite)
-# CREATE TABLE IF NOT EXISTS area_progress (
-#   user_id INTEGER,
-#   area_name TEXT,
-#   progress_json TEXT
-# );
+DB_NAME = "game.db"
 
-# =====================================================
-# 🔹 Ambil progress area (berapa kali player mengalahkan monster)
-# =====================================================
-async def get_area_progress(user_id: int, area_name: str):
-    async with aiosqlite.connect("game.db") as db:
+
+async def get_area_progress(user_id: int, area_name: str) -> Dict[str, int]:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT progress_json FROM area_progress WHERE user_id = ? AND area_name = ?",
+            """
+            SELECT monster_name, kills
+            FROM area_progress
+            WHERE user_id = ? AND area_name = ?
+            """,
             (user_id, area_name),
         ) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0]:
-                return json.loads(row[0])
-    return {}
+            return {name: kills for name, kills in await cursor.fetchall()}
 
-# =====================================================
-# 🔹 Update jumlah kill monster di area
-# =====================================================
-async def update_kill_count(user_id: int, area_name: str, monster_name: str):
-    progress = await get_area_progress(user_id, area_name)
-    progress[monster_name] = progress.get(monster_name, 0) + 1
 
-    async with aiosqlite.connect("game.db") as db:
+async def increment_kill(user_id: int, area_name: str, monster_name: str) -> None:
+    async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             """
-            INSERT INTO area_progress (user_id, area_name, progress_json)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, area_name) DO UPDATE SET
-            progress_json = excluded.progress_json
+            INSERT INTO area_progress (user_id, area_name, monster_name, kills)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(user_id, area_name, monster_name)
+            DO UPDATE SET kills = kills + 1
             """,
-            (user_id, area_name, json.dumps(progress)),
+            (user_id, area_name, monster_name),
         )
         await db.commit()
 
-# =====================================================
-# 💾 Simpan progress area (sesuai tabel area_name + monster_name)
-# =====================================================
-async def save_area_progress(user_id: int, area_name: str, progress: dict):
-    async with aiosqlite.connect("game.db") as db:
-        for monster_name, kills in progress.items():
-            await db.execute("""
-                INSERT INTO area_progress (user_id, area_name, monster_name, kills)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id, area_name, monster_name)
-                DO UPDATE SET kills = excluded.kills
-            """, (user_id, area_name, monster_name, kills))
+
+async def save_area_progress(
+    user_id: int, area_name: str, progress: Dict[str, int]
+) -> None:
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.executemany(
+            """
+            INSERT INTO area_progress (user_id, area_name, monster_name, kills)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, area_name, monster_name)
+            DO UPDATE SET kills = excluded.kills
+            """,
+            [
+                (user_id, area_name, monster, kills)
+                for monster, kills in progress.items()
+            ],
+        )
         await db.commit()
 
 
+Handler = Callable[[Update, Any], Awaitable[Any]]
 
 
+def _get_user(update: Update):
+    if update.effective_user:
+        return update.effective_user
+    if update.callback_query:
+        return update.callback_query.from_user
+    return None
 
 
-# =====================================================
-# 🧙‍♂️ DECORATOR: require_player
-# =====================================================
+def prevent_if_has_character(func: Handler) -> Handler:
+    """Block access if the player already created a character."""
 
-# utils/decorators.py
-import aiosqlite
-from functools import wraps
-from telegram import Update
-
-# =====================================================
-# ✅ 1. Cek kalau user SUDAH PUNYA karakter → cegah akses
-# =====================================================
-def prevent_if_has_character(func):
-    """Decorator untuk mencegah user yang sudah punya karakter menjalankan handler tertentu."""
     @wraps(func)
     async def wrapper(update: Update, context, *args, **kwargs):
-        query = getattr(update, "callback_query", None)
-        user = update.effective_user or (query.from_user if query else None)
-
+        user = _get_user(update)
         if not user:
             return
 
-        async with aiosqlite.connect("game.db") as db:
-            async with db.execute("SELECT 1 FROM players WHERE user_id = ?", (user.id,)) as cursor:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT 1 FROM players WHERE user_id = ?", (user.id,)
+            ) as cursor:
                 exists = await cursor.fetchone()
 
         if exists:
-            # Jika dia punya karakter, munculkan peringatan dan hentikan handler
+            query = getattr(update, "callback_query", None)
             if query:
-                await query.answer("⚠️ Kamu sudah memiliki karakter.", show_alert=True)
+                await query.answer(
+                    "Kamu sudah memiliki karakter. Gunakan /resetme jika ingin mengulang.",
+                    show_alert=True,
+                )
             elif update.message:
                 await update.message.reply_text(
                     "⚠️ Kamu sudah memiliki karakter. Gunakan /resetme untuk memulai ulang."
                 )
             return
 
-        # Lanjutkan handler jika belum punya karakter
         return await func(update, context, *args, **kwargs)
-    return wrapper
+
+    return wrapper  # type: ignore[return-value]
 
 
-# =====================================================
-# ✅ 2. Cek kalau user BELUM PUNYA karakter → cegah akses
-# =====================================================
-def require_player(func):
-    """Decorator untuk memastikan user sudah punya karakter sebelum lanjut."""
+def require_player(func: Handler) -> Handler:
+    """Ensure that the handler is only called for registered players."""
+
     @wraps(func)
     async def wrapper(update: Update, context, *args, **kwargs):
-        query = getattr(update, "callback_query", None)
-        user = update.effective_user or (query.from_user if query else None)
-
+        user = _get_user(update)
         if not user:
             return
 
-        async with aiosqlite.connect("game.db") as db:
-            async with db.execute("SELECT 1 FROM players WHERE user_id = ?", (user.id,)) as cursor:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT 1 FROM players WHERE user_id = ?", (user.id,)
+            ) as cursor:
                 exists = await cursor.fetchone()
 
         if not exists:
+            query = getattr(update, "callback_query", None)
             if query:
                 await query.answer(
-                    "⚠️ Kamu belum membuat karakter! Gunakan /start untuk memulai.",
+                    "Kamu belum membuat karakter! Gunakan /start terlebih dahulu.",
                     show_alert=True,
                 )
             elif update.message:
@@ -137,5 +135,5 @@ def require_player(func):
             return
 
         return await func(update, context, *args, **kwargs)
-    return wrapper
 
+    return wrapper  # type: ignore[return-value]
